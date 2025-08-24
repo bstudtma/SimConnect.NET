@@ -30,7 +30,7 @@ namespace SimConnect.NET.SimVar
         private uint nextDefinitionId;
         private uint nextRequestId;
         private bool disposed;
-        private TimeSpan requestTimeout = TimeSpan.FromSeconds(10);
+        private TimeSpan requestTimeout = Timeout.InfiniteTimeSpan; // Changed to infinite
 
         /// <summary>
         /// Initializes a new instance of the <see cref="SimVarManager"/> class.
@@ -98,6 +98,52 @@ namespace SimConnect.NET.SimVar
             var dynamicDefinition = new SimVarDefinition(simVarName, unit, dataType, false, "Dynamically created definition");
 
             return await this.GetWithDefinitionAsync<T>(dynamicDefinition, objectId, cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Test method for requesting multiple SimVars using a generic type.
+        /// </summary>
+        /// <typeparam name="T">The type of the expected result.</typeparam>
+        /// <param name="cancellationToken">Cancellation token for the operation.</param>
+        /// <returns>A task that represents the asynchronous test operation and returns the requested value.</returns>
+        public async Task<T> Test<T>(CancellationToken cancellationToken = default)
+        {
+            var typeGuid = (uint)typeof(T).GUID.GetHashCode();
+
+            var hr4 = SimConnectNative.SimConnect_ClearDataDefinition(
+                this.simConnectHandle,
+                typeGuid);
+
+            var hr1 = SimConnectNative.SimConnect_AddToDataDefinition(
+                this.simConnectHandle,
+                typeGuid,
+                "PLANE ALTITUDE",
+                "feet",
+                (uint)SimConnectDataType.FloatDouble);
+
+            Console.WriteLine($"SimConnect_AddToDataDefinition (PLANE ALTITUDE) returned: {hr1}");
+
+            var hr3 = SimConnectNative.SimConnect_AddToDataDefinition(
+                this.simConnectHandle,
+                typeGuid,
+                "AIRSPEED INDICATED",
+                "knots",
+                (uint)SimConnectDataType.FloatDouble);
+
+            Console.WriteLine($"SimConnect_AddToDataDefinition (AIRSPEED INDICATED) returned: {hr3}");
+
+            var requestId = Interlocked.Increment(ref this.nextRequestId);
+
+            var hr = SimConnectNative.SimConnect_RequestDataOnSimObject(
+                this.simConnectHandle,
+                requestId,
+                typeGuid,
+                SimConnectObjectIdUser,
+                (uint)SimConnectPeriod.Once);
+            var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+            this.pendingRequests[requestId] = tcs;
+
+            return await tcs.Task.ConfigureAwait(false);
         }
 
         /// <summary>
@@ -226,7 +272,7 @@ namespace SimConnect.NET.SimVar
                     var objectData = Marshal.PtrToStructure<SimConnectRecvSimObjectData>(data);
                     var requestId = objectData.RequestId;
 
-                    SimConnectLogger.Debug($"SimVar response received: RequestId={requestId}, DefineId={objectData.DefineId}, Size={recv.Size}");
+                    Console.WriteLine($"SimVar response received: RequestId={requestId}, DefineId={objectData.DefineId}, Size={recv.Size}");
 
                     if (this.pendingRequests.TryRemove(requestId, out var request))
                     {
@@ -240,22 +286,89 @@ namespace SimConnect.NET.SimVar
                             // Otherwise, treat as a struct T TaskCompletionSource stored by GetAsync<T>() struct overload
                             try
                             {
-                                if (this.defIndex.TryGetValue(objectData.DefineId, out var info))
-                                {
-                                    var headerSize = Marshal.SizeOf<SimConnectRecvSimObjectData>() - sizeof(ulong);
-                                    var dataPtr = IntPtr.Add(data, headerSize);
+                                var headerSize = Marshal.SizeOf<SimConnectRecvSimObjectData>() - sizeof(ulong);
+                                var dataPtr = IntPtr.Add(data, headerSize);
 
-                                    var tcsType = request.GetType();
-                                    if (tcsType.IsGenericType && tcsType.GetGenericTypeDefinition() == typeof(TaskCompletionSource<>))
+                                var tcsType = request.GetType();
+                                if (tcsType.IsGenericType && tcsType.GetGenericTypeDefinition() == typeof(TaskCompletionSource<>))
+                                {
+                                    var structType = tcsType.GetGenericArguments()[0];
+
+                                    // Reflect the [SimVar] fields in order and read each field sequentially
+                                    var getOrderedFields = typeof(SimConnect.NET.SimVar.Internal.SimVarStructBinder)
+                                        .GetMethod("GetOrderedFields", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public)
+                                        !.MakeGenericMethod(structType);
+                                    var ordered = (Array)getOrderedFields.Invoke(null, null)!;
+
+                                    var boxed = Activator.CreateInstance(structType)!;
+                                    var currentPtr = dataPtr;
+
+                                    foreach (var item in ordered)
                                     {
-                                        var resultValue = Marshal.PtrToStructure(dataPtr, info.Type);
-                                        var setResult = tcsType.GetMethod("TrySetResult");
-                                        setResult?.Invoke(request, new[] { resultValue });
+                                        // ValueTuple elements are exposed as public fields Item1/Item2 at runtime
+                                        var itemType = item.GetType();
+                                        var fields = itemType.GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public);
+
+                                        System.Reflection.FieldInfo? fieldField = null;
+                                        System.Reflection.FieldInfo? attrField = null;
+                                        foreach (var f in fields)
+                                        {
+                                            if (typeof(System.Reflection.FieldInfo).IsAssignableFrom(f.FieldType))
+                                            {
+                                                fieldField = f;
+                                            }
+                                            else if (typeof(SimVarAttribute).IsAssignableFrom(f.FieldType))
+                                            {
+                                                attrField = f;
+                                            }
+                                        }
+
+                                        if (fieldField == null || attrField == null)
+                                        {
+                                            throw new InvalidOperationException("Unexpected tuple shape from GetOrderedFields; missing FieldInfo/SimVarAttribute fields.");
+                                        }
+
+                                        var field = (System.Reflection.FieldInfo)fieldField.GetValue(item)!;
+                                        var attr = (SimVarAttribute)attrField.GetValue(item)!;
+
+                                        object? value = attr.DataType switch
+                                        {
+                                            SimConnectDataType.FloatDouble => ParseFloat64(currentPtr),
+                                            SimConnectDataType.FloatSingle => ParseFloat32(currentPtr),
+                                            SimConnectDataType.Integer32 => ParseInteger32(currentPtr),
+                                            SimConnectDataType.Integer64 => ParseInteger64(currentPtr),
+                                            SimConnectDataType.String8 or SimConnectDataType.String32 or SimConnectDataType.String64 or SimConnectDataType.String128 or SimConnectDataType.String256 or SimConnectDataType.String260 => ParseString(currentPtr, attr.DataType),
+                                            _ => throw new NotSupportedException($"Struct field type {attr.DataType} not supported in sequential parser"),
+                                        };
+
+                                        field.SetValue(boxed, value);
+
+                                        // Advance pointer by the size of the field payload we just read,
+                                        // rounded up to 8 bytes per SimConnect's 8-byte element packing.
+                                        var rawSize = attr.DataType switch
+                                        {
+                                            SimConnectDataType.FloatDouble => 8,
+                                            SimConnectDataType.FloatSingle => 4,
+                                            SimConnectDataType.Integer32 => 4,
+                                            SimConnectDataType.Integer64 => 8,
+                                            SimConnectDataType.String8 => 8,
+                                            SimConnectDataType.String32 => 32,
+                                            SimConnectDataType.String64 => 64,
+                                            SimConnectDataType.String128 => 128,
+                                            SimConnectDataType.String256 => 256,
+                                            SimConnectDataType.String260 => 260,
+                                            _ => throw new NotSupportedException($"Cannot advance for {attr.DataType}"),
+                                        };
+                                        var advance = Align8(rawSize);
+                                        currentPtr = IntPtr.Add(currentPtr, advance);
                                     }
+
+                                    var setResult = tcsType.GetMethod("TrySetResult");
+                                    setResult?.Invoke(request, new[] { boxed });
                                 }
                                 else
                                 {
-                                    SimConnectLogger.Warning($"No defIndex entry for DefineId={objectData.DefineId}.");
+                                    SimConnectLogger.Warning("Unexpected TCS type for struct response.");
                                 }
                             }
                             catch (Exception ex)
@@ -565,6 +678,13 @@ namespace SimConnect.NET.SimVar
             };
 
             return Marshal.PtrToStringAnsi(dataPtr, maxLength)?.TrimEnd('\0') ?? string.Empty;
+        }
+
+        private static int Align8(int size)
+        {
+            // Round up to next multiple of 8
+            var rem = size % 8;
+            return rem == 0 ? size : size + (8 - rem);
         }
 
         private static void CancelRequest(object request)
