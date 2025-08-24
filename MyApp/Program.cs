@@ -6,9 +6,8 @@ using SimConnect.NET;
 var client = new SimConnectClient();
 await client.ConnectAsync();
 
-// Get aircraft data
-var altitude = await client.SimVars.GetAsync<double>("PLANE ALTITUDE", "feet");
-var airspeed = await client.SimVars.GetAsync<double>("AIRSPEED INDICATED", "knots");
+// Get aircraft data in one shot using a SimVar-annotated struct
+var snapshot = await client.SimVars.GetAsync<MyApp.AircraftSnapshot>();
 
-Console.WriteLine($"Altitude: {altitude:F0} ft");
-Console.WriteLine($"Airspeed: {airspeed:F0} kts");
+Console.WriteLine($"Altitude: {snapshot.AltitudeFeet:F0} ft");
+Console.WriteLine($"Airspeed: {snapshot.IndicatedAirspeedKnots:F0} kts");
