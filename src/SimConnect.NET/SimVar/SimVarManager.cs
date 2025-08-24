@@ -98,6 +98,95 @@ namespace SimConnect.NET.SimVar
         }
 
         /// <summary>
+        /// Subscribes to a SimVar definition with a recurring period and invokes a callback for each value.
+        /// </summary>
+        /// <typeparam name="T">The expected return type.</typeparam>
+        /// <param name="definition">The SimVar definition.</param>
+        /// <param name="objectId">The object ID; defaults to user aircraft.</param>
+        /// <param name="period">The desired update period.</param>
+        /// <param name="onValue">Callback invoked for each received value.</param>
+        /// <param name="cancellationToken">Cancellation token to end the subscription.</param>
+        /// <returns>A task that completes when cancelled or an error occurs.</returns>
+        public async Task SubscribeAsync<T>(
+            SimVarDefinition definition,
+            uint objectId,
+            SimConnectPeriod period,
+            Action<T> onValue,
+            CancellationToken cancellationToken = default)
+        {
+            ObjectDisposedException.ThrowIf(this.disposed, nameof(SimVarManager));
+            ArgumentNullException.ThrowIfNull(onValue);
+
+            var definitionId = await this.EnsureDataDefinitionAsync(definition, cancellationToken).ConfigureAwait(false);
+            var requestId = Interlocked.Increment(ref this.nextRequestId);
+
+            var request = new SimVarRequest<T>(requestId, definition, objectId, isRecurring: true, onValue);
+            this.pendingRequests[requestId] = request;
+
+            SimConnectLogger.Debug($"Subscribing to SimVar: {definition.Name}, RequestId={requestId}, DefinitionId={definitionId}, Period={period}");
+
+            var result = SimConnectNative.SimConnect_RequestDataOnSimObject(
+                this.simConnectHandle,
+                requestId,
+                definitionId,
+                objectId,
+                (uint)period);
+
+            if (result != (int)SimConnectError.None)
+            {
+                this.pendingRequests.TryRemove(requestId, out _);
+                throw new SimConnectException($"Failed to subscribe to SimVar {definition.Name}: {(SimConnectError)result}", (SimConnectError)result);
+            }
+
+            try
+            {
+                using (cancellationToken.Register(() =>
+                {
+                    try
+                    {
+                        var stop = SimConnectNative.SimConnect_RequestDataOnSimObject(
+                            this.simConnectHandle,
+                            requestId,
+                            definitionId,
+                            objectId,
+                            (uint)SimConnectPeriod.Never);
+
+                        if (stop != (int)SimConnectError.None)
+                        {
+                            SimConnectLogger.Debug($"Stop subscription failed for {definition.Name} (RequestId={requestId}): {(SimConnectError)stop}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        SimConnectLogger.Debug($"Exception stopping subscription for {definition.Name} (RequestId={requestId}): {ex.Message}");
+                    }
+
+                    this.pendingRequests.TryRemove(requestId, out _);
+                    request.SetCanceled();
+                }))
+                {
+                    try
+                    {
+                        await request.Task.ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Graceful exit on cancellation; do not throw
+                    }
+                    catch (Exception ex)
+                    {
+                        SimConnectLogger.Debug($"Exception in SimVar subscription for {definition.Name} (RequestId={requestId}): {ex}");
+                    }
+                }
+            }
+            catch
+            {
+                this.pendingRequests.TryRemove(requestId, out _);
+                throw;
+            }
+        }
+
+        /// <summary>
         /// Sets a SimVar value asynchronously.
         /// </summary>
         /// <typeparam name="T">The type of value to set.</typeparam>
@@ -166,10 +255,22 @@ namespace SimConnect.NET.SimVar
 
                     SimConnectLogger.Debug($"SimVar response received: RequestId={requestId}, DefineId={objectData.DefineId}, Size={recv.Size}");
 
-                    if (this.pendingRequests.TryRemove(requestId, out var request))
+                    if (this.pendingRequests.TryGetValue(requestId, out var request))
                     {
-                        // Complete the request with the received data
+                        // Complete the request with the received data; recurring requests will keep the subscription alive
                         CompleteRequest(request, data, dataSize);
+
+                        // Remove one-shot requests
+                        var requestType = request.GetType();
+                        if (requestType.IsGenericType && requestType.GetGenericTypeDefinition() == typeof(SimVarRequest<>))
+                        {
+                            var prop = requestType.GetProperty("IsRecurring");
+                            var isRecurring = prop != null && prop.PropertyType == typeof(bool) && (bool)(prop.GetValue(request) ?? false);
+                            if (!isRecurring)
+                            {
+                                this.pendingRequests.TryRemove(requestId, out _);
+                            }
+                        }
                     }
                     else
                     {
@@ -182,6 +283,49 @@ namespace SimConnect.NET.SimVar
                 // Log error but don't throw - this shouldn't break the message processing loop
                 SimConnectLogger.Error("Error processing SimVar data", ex);
             }
+        }
+
+        /// <summary>
+        /// Subscribes to a SimVar by name/unit with a recurring period and invokes a callback for each value.
+        /// </summary>
+        /// <typeparam name="T">The expected return type.</typeparam>
+        /// <param name="simVarName">The SimVar name.</param>
+        /// <param name="unit">The unit of measurement.</param>
+        /// <param name="period">The desired update period.</param>
+        /// <param name="onValue">Callback invoked for each received value.</param>
+        /// <param name="objectId">The object ID; defaults to user aircraft.</param>
+        /// <param name="cancellationToken">Cancellation token to end the subscription.</param>
+        /// <returns>A task that completes when cancelled or an error occurs.</returns>
+        public async Task SubscribeAsync<T>(
+            string simVarName,
+            string unit,
+            SimConnectPeriod period,
+            Action<T> onValue,
+            uint objectId = SimConnectObjectIdUser,
+            CancellationToken cancellationToken = default)
+        {
+            ObjectDisposedException.ThrowIf(this.disposed, nameof(SimVarManager));
+            ArgumentException.ThrowIfNullOrEmpty(simVarName);
+            ArgumentException.ThrowIfNullOrEmpty(unit);
+            ArgumentNullException.ThrowIfNull(onValue);
+
+            // Prefer registry definition if present to validate types
+            var definition = SimVarRegistry.Get(simVarName);
+            if (definition != null)
+            {
+                if (!IsTypeCompatible(typeof(T), definition.NetType))
+                {
+                    throw new ArgumentException($"Type {typeof(T).Name} is not compatible with SimVar {simVarName} which expects {definition.NetType.Name}");
+                }
+
+                await this.SubscribeAsync<T>(definition, objectId, period, onValue, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            // Create dynamic definition
+            var dataType = InferDataType<T>();
+            var dynamicDefinition = new SimVarDefinition(simVarName, unit, dataType, false, "Dynamically created definition");
+            await this.SubscribeAsync<T>(dynamicDefinition, objectId, period, onValue, cancellationToken).ConfigureAwait(false);
         }
 
         /// <summary>
