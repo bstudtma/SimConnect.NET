@@ -28,7 +28,7 @@ namespace SimConnect.NET
             }
             else
             {
-                throw new ArgumentException($"SimVar '{name}' not found in registry. Please specify unit and dataType explicitly.", nameof(name));
+                // throw new ArgumentException($"SimVar '{name}' not found in registry. Please specify unit and dataType explicitly.", nameof(name));
             }
         }
 
@@ -46,10 +46,6 @@ namespace SimConnect.NET
                 this.Unit = simVar.Unit;
                 this.DataType = simVar.DataType;
             }
-            else
-            {
-                throw new ArgumentException($"SimVar '{name}' not found in registry. Please specify unit and dataType explicitly.", nameof(name));
-            }
         }
 
         /// <summary>
@@ -58,7 +54,7 @@ namespace SimConnect.NET
         /// <param name="name">The SimVar name to marshal.</param>
         /// <param name="unit">The unit of the SimVar.</param>
         /// <param name="dataType">The SimConnect data type for marshaling.</param>
-        public SimConnectAttribute(string name, string unit, SimConnectDataType dataType)
+        public SimConnectAttribute(string name, string? unit, SimConnectDataType dataType)
         {
             this.Name = name;
             this.Unit = unit;
@@ -72,12 +68,25 @@ namespace SimConnect.NET
         /// <param name="unit">The unit of the SimVar.</param>
         /// <param name="dataType">The SimConnect data type for marshaling.</param>
         /// <param name="order">The order in which the SimVar should be marshaled.</param>
-        public SimConnectAttribute(string name, string? unit, SimConnectDataType dataType, int order)
+        public SimConnectAttribute(string name, string? unit = null, SimConnectDataType? dataType = null, int? order = null)
         {
             this.Name = name;
             this.Unit = unit;
             this.DataType = dataType;
             this.Order = order;
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="SimConnectAttribute"/> class with name and data type.
+        /// The unit is left unspecified.
+        /// </summary>
+        /// <param name="name">The SimVar name to marshal.</param>
+        /// <param name="dataType">The SimConnect data type for marshaling.</param>
+        public SimConnectAttribute(string name, SimConnectDataType dataType)
+        {
+            this.Name = name;
+            this.Unit = null;
+            this.DataType = dataType;
         }
 
         /// <summary>
@@ -93,11 +102,11 @@ namespace SimConnect.NET
         /// <summary>
         /// Gets the SimConnect data type for marshaling.
         /// </summary>
-        public SimConnectDataType DataType { get; }
+        public SimConnectDataType? DataType { get; }
 
         /// <summary>
         /// Gets the order in which the SimVar should be marshaled.
         /// </summary>
-        public int Order { get; }
+        public int? Order { get; }
     }
 }
