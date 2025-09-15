@@ -209,7 +209,7 @@ namespace SimConnect.NET.Tests.Net8.Tests
                 },
                 cancellationToken: cancellationToken);
 
-            // Allow 1 seconds for initial subscription updates before enumerating
+            // Allow 1 second for initial subscription updates before enumerating
             await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
 
             if (subscription.Completion.IsFaulted)
