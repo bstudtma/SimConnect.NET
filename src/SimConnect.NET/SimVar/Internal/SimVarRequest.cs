@@ -30,7 +30,7 @@ namespace SimConnect.NET.SimVar.Internal
             this.RequestId = requestId;
             this.ObjectId = objectId;
             this.DefinitionId = definitionId;
-            this.taskCompletionSource = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously); // Ensure continuations don't run inline on the SimConnect thread; schedule them asynchronously
+            this.taskCompletionSource = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously); // Prevent continuations from blocking SimConnect thread
             this.Period = period;
             this.OnValue = onValue;
         }
