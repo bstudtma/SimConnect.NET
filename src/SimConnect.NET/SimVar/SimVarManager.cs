@@ -79,7 +79,6 @@ namespace SimConnect.NET.SimVar
             ObjectDisposedException.ThrowIf(this.disposed, nameof(SimVarManager));
             ArgumentException.ThrowIfNullOrEmpty(simVarName);
 
-            // ArgumentException.ThrowIfNullOrEmpty(unit);
             // Resolve to a definition ID (registry-backed or dynamic)
             uint definitionId = this.EnsureScalarDefinition(simVarName, unit, InferDataType<T>(), cancellationToken);
             return await this.GetAsyncCore<T>(definitionId, objectId, cancellationToken).ConfigureAwait(false);
