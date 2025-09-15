@@ -66,7 +66,6 @@ namespace SimConnect.NET.SimVar.Internal
         /// </summary>
         public Action<T>? OnValue { get; }
 
-
         /// <summary>
         /// Gets the task that completes when the request is fulfilled.
         /// </summary>
