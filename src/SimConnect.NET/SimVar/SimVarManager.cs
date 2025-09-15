@@ -663,7 +663,6 @@ namespace SimConnect.NET.SimVar
             }
         }
 
-        // Descriptor-based StartRequest overload removed; single path handles both scalars and structs.
         private async Task SetWithDefinitionAsync<T>(SimVarDefinition definition, T value, uint objectId, CancellationToken cancellationToken)
         {
             var definitionId = this.EnsureDataDefinition(definition, cancellationToken);
