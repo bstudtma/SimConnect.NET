@@ -85,6 +85,7 @@ namespace SimConnect.NET.SimVar
             Register(new SimVarDefinition("PLANE HEADING DEGREES MAGNETIC", "degrees", SimConnectDataType.FloatDouble, true, "Aircraft magnetic heading"));
             Register(new SimVarDefinition("PLANE PITCH DEGREES", "degrees", SimConnectDataType.FloatDouble, true, "Aircraft pitch"));
             Register(new SimVarDefinition("PLANE BANK DEGREES", "degrees", SimConnectDataType.FloatDouble, true, "Aircraft bank"));
+            Register(new SimVarDefinition("STRUCT LATLONALT", string.Empty, SimConnectDataType.LatLonAlt, false, "Aircraft position and altitude structure"));
 
             // Aircraft Motion
             Register(new SimVarDefinition("AIRSPEED INDICATED", "knots", SimConnectDataType.FloatDouble, false, "Indicated airspeed"));

@@ -19,15 +19,16 @@ namespace SimConnect.NET.SimVar
         private const uint SimConnectObjectIdUser = 0;
         private const uint BaseDefinitionId = 10000;
         private const uint BaseRequestId = 20000;
-        private static readonly ThreadLocal<byte[]> Float32Bytes = new(() => new byte[4]);
-        private static readonly ThreadLocal<byte[]> Float64Bytes = new(() => new byte[8]);
 
         private readonly IntPtr simConnectHandle;
-        private readonly ConcurrentDictionary<uint, object> pendingRequests;
-        private readonly ConcurrentDictionary<(string Name, string Unit), uint> dataDefinitions;
-        private readonly ConcurrentDictionary<uint, (System.Reflection.FieldInfo Field, SimConnectAttribute Attr)[]> defIndex = new();
+        private readonly ConcurrentDictionary<uint, ISimVarRequest> pendingRequests = new();
+        private readonly ConcurrentDictionary<(string Name, string Unit, SimConnectDataType DataType), uint> dataDefinitions = new();
         private readonly ConcurrentDictionary<Type, uint> typeToDefIndex = new();
+        private readonly ConcurrentDictionary<uint, Action<IntPtr, ISimVarRequest>> defToParser = new();
+        private readonly ConcurrentDictionary<uint, SimVarSubscription> subscriptions = new();
+        private readonly object typeDefinitionSync = new();
 
+        // Removed reflection caches by switching to ISimVarRequest hot-path
         private uint nextDefinitionId;
         private uint nextRequestId;
         private bool disposed;
@@ -40,8 +41,6 @@ namespace SimConnect.NET.SimVar
         public SimVarManager(IntPtr simConnectHandle)
         {
             this.simConnectHandle = simConnectHandle != IntPtr.Zero ? simConnectHandle : throw new ArgumentException("Invalid SimConnect handle", nameof(simConnectHandle));
-            this.pendingRequests = new ConcurrentDictionary<uint, object>();
-            this.dataDefinitions = new ConcurrentDictionary<(string, string), uint>();
             this.nextDefinitionId = BaseDefinitionId;
             this.nextRequestId = BaseRequestId;
         }
@@ -75,30 +74,14 @@ namespace SimConnect.NET.SimVar
         /// <returns>A task that represents the asynchronous get operation.</returns>
         /// <exception cref="SimConnectException">Thrown when the operation fails.</exception>
         /// <exception cref="ArgumentException">Thrown when the SimVar type doesn't match the expected type.</exception>
-        public async Task<T> GetAsync<T>(string simVarName, string unit, uint objectId = SimConnectObjectIdUser, CancellationToken cancellationToken = default)
+        public async Task<T> GetAsync<T>(string simVarName, string unit = "", uint objectId = SimConnectObjectIdUser, CancellationToken cancellationToken = default)
         {
             ObjectDisposedException.ThrowIf(this.disposed, nameof(SimVarManager));
             ArgumentException.ThrowIfNullOrEmpty(simVarName);
-            ArgumentException.ThrowIfNullOrEmpty(unit);
 
-            // Try to get definition from registry first
-            var definition = SimVarRegistry.Get(simVarName);
-            if (definition != null)
-            {
-                // Validate the requested type matches the definition
-                if (!IsTypeCompatible(typeof(T), definition.NetType))
-                {
-                    throw new ArgumentException($"Type {typeof(T).Name} is not compatible with SimVar {simVarName} which expects {definition.NetType.Name}");
-                }
-
-                return await this.GetWithDefinitionAsync<T>(definition, objectId, cancellationToken).ConfigureAwait(false);
-            }
-
-            // If not in registry, create a dynamic definition
-            var dataType = InferDataType<T>();
-            var dynamicDefinition = new SimVarDefinition(simVarName, unit, dataType, false, "Dynamically created definition");
-
-            return await this.GetWithDefinitionAsync<T>(dynamicDefinition, objectId, cancellationToken).ConfigureAwait(false);
+            // Resolve to a definition ID (registry-backed or dynamic)
+            uint definitionId = this.EnsureScalarDefinition(simVarName, unit, InferDataType<T>(), cancellationToken);
+            return await this.GetAsyncCore<T>(definitionId, objectId, cancellationToken).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -155,6 +138,7 @@ namespace SimConnect.NET.SimVar
         public async Task<T> GetAsync<T>(
             uint objectId = SimConnectObjectIdUser,
             CancellationToken cancellationToken = default)
+            where T : struct
         {
             ObjectDisposedException.ThrowIf(this.disposed, nameof(SimVarManager));
             cancellationToken.ThrowIfCancellationRequested();
@@ -164,49 +148,8 @@ namespace SimConnect.NET.SimVar
                 throw new InvalidOperationException("SimConnect handle is not initialized.");
             }
 
-            // Build definition for the struct using the native handle directly to avoid client coupling.
-            if (!this.typeToDefIndex.TryGetValue(typeof(T), out var defId))
-            {
-                var (newDefId, fields) = SimVarStructBinder.BuildAndRegisterFromStruct<T>(this.simConnectHandle);
-                this.defIndex[newDefId] = fields;
-                this.typeToDefIndex[typeof(T)] = newDefId;
-                defId = newDefId;
-            }
-
-            var requestId = Interlocked.Increment(ref this.nextRequestId);
-            var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
-            this.pendingRequests[requestId] = tcs;
-
-            // Request data once for the specified object.
-            var hr = SimConnectNative.SimConnect_RequestDataOnSimObject(
-                this.simConnectHandle,
-                requestId,
-                defId,
-                objectId,
-                (uint)SimConnectPeriod.Once);
-
-            if (hr != (int)SimConnectError.None)
-            {
-                this.pendingRequests.TryRemove(requestId, out _);
-                throw new SimConnectException($"Failed to request struct {typeof(T).Name}: {(SimConnectError)hr}", (SimConnectError)hr);
-            }
-
-            using (cancellationToken.Register(() => tcs.TrySetCanceled(cancellationToken)))
-            {
-                // Apply optional manager timeout consistent with SimVar value requests
-                if (this.requestTimeout != Timeout.InfiniteTimeSpan)
-                {
-                    var timeoutTask = Task.Delay(this.requestTimeout, CancellationToken.None);
-                    var completed = await Task.WhenAny(tcs.Task, timeoutTask).ConfigureAwait(false);
-                    if (completed == timeoutTask)
-                    {
-                        this.pendingRequests.TryRemove(requestId, out _);
-                        throw new TimeoutException($"Struct request '{typeof(T).Name}' timed out after {this.requestTimeout} (RequestId={requestId})");
-                    }
-                }
-
-                return await tcs.Task.ConfigureAwait(false);
-            }
+            var defId = this.EnsureTypeDefinition<T>(cancellationToken);
+            return await this.GetAsyncCore<T>(defId, objectId, cancellationToken).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -226,72 +169,73 @@ namespace SimConnect.NET.SimVar
                 // Read the basic SIMCONNECT_RECV structure to get the message type
                 var recv = Marshal.PtrToStructure<SimConnectRecv>(data);
 
-                if (recv.Id == (uint)SimConnectRecvId.SimobjectData)
+                switch ((SimConnectRecvId)recv.Id)
                 {
-                    // Parse the full SimConnectRecvSimObjectData structure (which includes the base SimConnectRecv)
-                    var objectData = Marshal.PtrToStructure<SimConnectRecvSimObjectData>(data);
-                    var requestId = objectData.RequestId;
+                    case SimConnectRecvId.SimobjectData:
+                    case SimConnectRecvId.SimobjectDataByType:
+                        {
+                            // Both structures are layout-identical; use SimConnectRecvSimObjectData header
+                            var objectData = Marshal.PtrToStructure<SimConnectRecvSimObjectData>(data);
 
-                    if (this.pendingRequests.TryRemove(requestId, out var request))
-                    {
-                        // If this is a simple SimVarRequest<>, use existing completion logic
-                        if (request.GetType().IsGenericType && request.GetType().GetGenericTypeDefinition() == typeof(SimVarRequest<>))
-                        {
-                            CompleteRequest(request, data, dataSize);
-                        }
-                        else
-                        {
-                            // Otherwise, treat as a struct T TaskCompletionSource stored by GetAsync<T>() struct overload
+                            // Validate header vs buffer sizes
+                            var headerSize = Marshal.SizeOf<SimConnectRecvSimObjectData>() - sizeof(ulong); // data payload starts after the Data field offset
+                            if (dataSize < headerSize || objectData.Size < headerSize)
+                            {
+                                SimConnectLogger.Warning($"SimObjectData header shorter than expected (DataSize={dataSize}, ReportedSize={objectData.Size}, HeaderSize={headerSize})");
+                                return;
+                            }
+
+                            var requestId = objectData.RequestId;
+                            if (!this.pendingRequests.TryGetValue(requestId, out var request))
+                            {
+                                SimConnectLogger.Warning($"No pending request found for RequestId={requestId}");
+                                return;
+                            }
+
+                            var definitionId = objectData.DefineId;
+                            if (!this.defToParser.TryGetValue(definitionId, out var parse))
+                            {
+                                SimConnectLogger.Error($"No parser found for DefinitionId={definitionId} (RequestId={requestId})");
+                                return;
+                            }
+
+                            // Compute payload ptr and perform a minimal sanity check using reported size
+                            var dataPtr = IntPtr.Add(data, headerSize);
+                            var reportedPayload = (int)objectData.Size - headerSize;
+                            if (reportedPayload <= 0)
+                            {
+                                SimConnectLogger.Warning($"Empty payload for DefinitionId={definitionId}, RequestId={requestId}");
+                                return;
+                            }
+
                             try
                             {
-                                var definitionId = objectData.DefineId;
-                                if (!this.defIndex.TryGetValue(definitionId, out var fields))
-                                {
-                                    throw new InvalidOperationException($"No struct definition found for DefineId={definitionId}");
-                                }
-                                else
-                                {
-                                    var headerSize = Marshal.SizeOf<SimConnectRecvSimObjectData>() - sizeof(ulong);
-                                    var dataPtr = IntPtr.Add(data, headerSize);
-                                    var currentPtr = dataPtr;
-                                    var tcsType = request.GetType();
-                                    if (tcsType.IsGenericType && tcsType.GetGenericTypeDefinition() == typeof(TaskCompletionSource<>))
-                                    {
-                                        var structType = tcsType.GetGenericArguments()[0];
-                                        var boxed = Activator.CreateInstance(structType)!;
-                                        foreach (var (field, attr) in fields)
-                                        {
-                                            var simConnectType = attr.DataType;
-                                            var fieldType = field.FieldType;
-                                            var simConnectSize = SimVarDataTypeSizing.GetDatumSizeBytes(simConnectType);
-                                            var fieldName = field.Name;
-                                            object? value = ParseType(currentPtr, simConnectType, fieldType);
-                                            field.SetValue(boxed, value);
-                                            currentPtr = IntPtr.Add(currentPtr, simConnectSize);
-                                        }
-
-                                        var trySetResultMethod = tcsType.GetMethod("TrySetResult");
-                                        trySetResultMethod?.Invoke(request, new[] { boxed });
-                                    }
-                                    else
-                                    {
-                                        SimConnectLogger.Warning("Unexpected TCS type for struct response.");
-                                    }
-                                }
+                                parse(dataPtr, request);
                             }
                             catch (Exception ex)
                             {
-                                SimConnectLogger.Error("Error completing struct request", ex);
-                                var tcsType = request.GetType();
-                                var setEx = tcsType.GetMethod("TrySetException", new[] { typeof(Exception) });
-                                setEx?.Invoke(request, new object[] { ex });
+                                SimConnectLogger.Error($"Error completing SimVar request (RequestId={requestId}, DefinitionId={definitionId})", ex);
+                                if (request is ISimVarRequest req)
+                                {
+                                    req.SetException(ex);
+                                }
                             }
+                            finally
+                            {
+                                // Ensure non-recurring requests are always removed from the pending table so
+                                // they do not remain referenced indefinitely in error or cancellation paths.
+                                if (!request.IsRecurring)
+                                {
+                                    this.pendingRequests.TryRemove(requestId, out _);
+                                }
+                            }
+
+                            break;
                         }
-                    }
-                    else
-                    {
-                        SimConnectLogger.Warning($"No pending request found for RequestId={requestId}");
-                    }
+
+                    default:
+                        // Not a SimVar data message we handle here
+                        break;
                 }
             }
             catch (Exception ex)
@@ -302,22 +246,194 @@ namespace SimConnect.NET.SimVar
         }
 
         /// <summary>
+        /// Starts a recurring SimVar subscription (typed struct) and returns a disposable handle immediately.
+        /// </summary>
+        /// <typeparam name="T">Struct type representing the aggregated data.</typeparam>
+        /// <param name="period">Update period (must be recurring, i.e. not Once/Never).</param>
+        /// <param name="onValue">Callback invoked for each received value.</param>
+        /// <param name="objectId">Sim object id; defaults to user aircraft.</param>
+        /// <param name="cancellationToken">Cancellation token to auto-dispose the subscription.</param>
+        /// <returns>Subscription handle.</returns>
+        public ISimVarSubscription Subscribe<T>(
+            SimConnectPeriod period,
+            Action<T> onValue,
+            uint objectId = SimConnectObjectIdUser,
+            CancellationToken cancellationToken = default)
+            where T : struct
+        {
+            ObjectDisposedException.ThrowIf(this.disposed, nameof(SimVarManager));
+            ArgumentNullException.ThrowIfNull(onValue);
+            if (period == SimConnectPeriod.Once || period == SimConnectPeriod.Never)
+            {
+                throw new ArgumentException("Use GetAsync for one-shot requests; subscription requires a recurring period.", nameof(period));
+            }
+
+            var defId = this.EnsureTypeDefinition<T>(cancellationToken);
+            var request = this.StartRequest<T>(defId, objectId, period, onValue);
+            var subscription = new SimVarSubscription(this, request, cancellationToken);
+            this.subscriptions[request.RequestId] = subscription;
+            return subscription;
+        }
+
+        /// <summary>
+        /// Starts a recurring SimVar subscription (scalar by name/unit) and returns a disposable handle immediately.
+        /// </summary>
+        /// <typeparam name="T">Expected scalar type.</typeparam>
+        /// <param name="simVarName">SimVar name.</param>
+        /// <param name="unit">Unit string.</param>
+        /// <param name="period">Update period (must be recurring).</param>
+        /// <param name="onValue">Callback for each received value.</param>
+        /// <param name="objectId">Target object id.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <returns>Subscription handle.</returns>
+        public ISimVarSubscription Subscribe<T>(
+            string simVarName,
+            string unit,
+            SimConnectPeriod period,
+            Action<T> onValue,
+            uint objectId = SimConnectObjectIdUser,
+            CancellationToken cancellationToken = default)
+        {
+            ObjectDisposedException.ThrowIf(this.disposed, nameof(SimVarManager));
+            ArgumentException.ThrowIfNullOrEmpty(simVarName);
+            ArgumentException.ThrowIfNullOrEmpty(unit);
+            ArgumentNullException.ThrowIfNull(onValue);
+            if (period == SimConnectPeriod.Once || period == SimConnectPeriod.Never)
+            {
+                throw new ArgumentException("Use GetAsync for one-shot requests; subscription requires a recurring period.", nameof(period));
+            }
+
+            var defId = this.EnsureScalarDefinition(simVarName, unit, InferDataType<T>(), cancellationToken);
+            var request = this.StartRequest<T>(defId, objectId, period, onValue);
+            var subscription = new SimVarSubscription(this, request, cancellationToken);
+            this.subscriptions[request.RequestId] = subscription;
+            return subscription;
+        }
+
+        /// <summary>
         /// Disposes the SimVar manager and cancels all pending requests.
         /// </summary>
         public void Dispose()
         {
             if (!this.disposed)
             {
-                // Cancel all pending requests
+                this.disposed = true;
+
+                // Dispose all active subscriptions (will invoke CancelRequest and remove themselves)
+                foreach (var kvp in this.subscriptions)
+                {
+                    try
+                    {
+                        kvp.Value.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        SimConnectLogger.Debug($"Suppressing error disposing subscription {kvp.Key}: {ex.Message}");
+                    }
+                }
+
+                this.subscriptions.Clear();
+
                 foreach (var kvp in this.pendingRequests)
                 {
-                    CancelRequest(kvp.Value);
+                    kvp.Value.SetCanceled();
                 }
 
                 this.pendingRequests.Clear();
                 this.dataDefinitions.Clear();
-                this.disposed = true;
             }
+        }
+
+        /// <summary>
+        /// Ensures a data definition exists and is registered with a parser for type T.
+        /// - For typed structs, builds descriptor via SimVarDescriptorFactory and registers parser and def index once.
+        /// </summary>
+        /// <typeparam name="T">struct type described by the definition.</typeparam>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <returns>Definition ID for the SimConnect data definition.</returns>
+        internal uint EnsureTypeDefinition<T>(CancellationToken cancellationToken)
+            where T : struct
+        {
+            if (this.typeToDefIndex.TryGetValue(typeof(T), out var existing))
+            {
+                return existing;
+            }
+
+            lock (this.typeDefinitionSync)
+            {
+                if (this.typeToDefIndex.TryGetValue(typeof(T), out existing))
+                {
+                    return existing;
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var definitionId = Interlocked.Increment(ref this.nextDefinitionId);
+
+                var readers = SimVarFieldReaderFactory.Build<T>(
+                    (name, unit, dataType) =>
+                    {
+                        var hr = SimConnectNative.SimConnect_AddToDataDefinition(
+                            this.simConnectHandle,
+                            definitionId,
+                            name,
+                            unit ?? string.Empty,
+                            (uint)dataType);
+
+                        if (hr != (int)SimConnectError.None)
+                        {
+                            throw new SimConnectException($"Failed to add data definition for {name}: {(SimConnectError)hr}", (SimConnectError)hr);
+                        }
+                    });
+
+                this.defToParser[definitionId] = (IntPtr basePtr, ISimVarRequest req) =>
+                {
+                    var result = default(T);
+                    foreach (var reader in readers)
+                    {
+                        reader.ReadInto(ref result, basePtr);
+                    }
+
+                    if (!req.TrySetResult(result))
+                    {
+                        req.SetResultBoxed(result);
+                    }
+                };
+                this.typeToDefIndex[typeof(T)] = definitionId;
+                return definitionId;
+            }
+        }
+
+        /// <summary>
+        /// Cancels a pending or recurring SimVar request and removes it from tracking.
+        /// For recurring requests a SimConnect 'Never' period request is issued to stop further updates.
+        /// Safe to call multiple times; subsequent calls are no-ops after removal.
+        /// </summary>
+        /// <param name="request">The request to cancel.</param>
+        internal void CancelRequest(ISimVarRequest request)
+        {
+            if (request is null)
+            {
+                return;
+            }
+
+            this.pendingRequests.TryRemove(request.RequestId, out _);
+            this.subscriptions.TryRemove(request.RequestId, out _);
+
+            if (request.IsRecurring)
+            {
+                try
+                {
+                    SimConnectLogger.Debug($"Canceling recurring request {request.RequestId} (Def={request.DefinitionId}, Obj={request.ObjectId})");
+                    this.RequestDataOnSimObject(request.RequestId, request.DefinitionId, request.ObjectId, SimConnectPeriod.Never);
+                }
+                catch (Exception ex)
+                {
+                    SimConnectLogger.Debug($"Suppressing error during CancelRequest for {request.RequestId}: {ex.Message}");
+                }
+            }
+
+            request.SetCanceled();
         }
 
         private static SimConnectDataType InferDataType<T>()
@@ -428,139 +544,6 @@ namespace SimConnect.NET.SimVar
             }
         }
 
-        private static void CompleteRequest(object request, IntPtr data, uint dataSize)
-        {
-            var requestType = request.GetType();
-            if (!requestType.IsGenericType || requestType.GetGenericTypeDefinition() != typeof(SimVarRequest<>))
-            {
-                return;
-            }
-
-            try
-            {
-                var valueType = requestType.GetGenericArguments()[0];
-                var simVarRequest = request as dynamic;
-                var definition = simVarRequest?.Definition as SimVarDefinition;
-
-                if (definition == null)
-                {
-                    var setExceptionMethod = requestType.GetMethod("SetException");
-                    setExceptionMethod?.Invoke(request, new object[] { new InvalidOperationException("SimVar definition is null") });
-                    return;
-                }
-
-                // Calculate the offset to the actual data
-                // The data follows the SimConnectRecvSimObjectData structure
-                // The actual data starts after the fixed header (Size, Version, Id, RequestId, ObjectId, DefineId, Flags, EntryNumber, OutOf, DefineCount)
-                var headerSize = Marshal.SizeOf<SimConnectRecvSimObjectData>() - sizeof(ulong); // Subtract the Data field which is part of the actual data
-                var dataPtr = IntPtr.Add(data, headerSize);
-
-                SimConnectLogger.Debug($"Completing request for {definition.Name}, DataType={definition.DataType}, ValueType={valueType.Name}, HeaderSize={headerSize}");
-
-                // Parse the data based on the definition's data type
-                var parsedValue = ParseDataByType(dataPtr, definition.DataType, valueType);
-
-                // Use reflection to call SetResult directly, avoiding dynamic
-                var setResultMethod = requestType.GetMethod("SetResult");
-                setResultMethod?.Invoke(request, new[] { parsedValue });
-            }
-            catch (Exception ex)
-            {
-                SimConnectLogger.Error("Error completing request", ex);
-                var setExceptionMethod = requestType.GetMethod("SetException");
-                setExceptionMethod?.Invoke(request, new object[] { ex });
-            }
-        }
-
-        private static object? ParseDataByType(IntPtr dataPtr, SimConnectDataType dataType, Type expectedType)
-        {
-            return dataType switch
-            {
-                SimConnectDataType.Integer32 => ParseInteger32Value(dataPtr, expectedType),
-                SimConnectDataType.Integer64 => (object)ParseInteger64(dataPtr),
-                SimConnectDataType.FloatSingle => (object)ParseFloat32(dataPtr),
-                SimConnectDataType.FloatDouble => ParseFloat64Value(dataPtr, expectedType),
-                SimConnectDataType.String8 or
-                SimConnectDataType.String32 or
-                SimConnectDataType.String64 or
-                SimConnectDataType.String128 or
-                SimConnectDataType.String256 or
-                SimConnectDataType.String260 or
-                SimConnectDataType.StringV => ParseString(dataPtr, dataType),
-                SimConnectDataType.LatLonAlt => Marshal.PtrToStructure<SimConnectDataLatLonAlt>(dataPtr),
-                SimConnectDataType.Xyz => Marshal.PtrToStructure<SimConnectDataXyz>(dataPtr),
-                _ => throw new NotSupportedException($"Data type {dataType} is not supported"),
-            };
-        }
-
-#pragma warning disable CA1859 // Use concrete types when possible for improved performance
-        private static object ParseInteger32Value(IntPtr dataPtr, Type expectedType)
-        {
-            var value = ParseInteger32(dataPtr);
-
-            // Handle boolean conversion
-            if (expectedType == typeof(bool))
-            {
-                return value != 0;
-            }
-
-            return value;
-        }
-#pragma warning restore CA1859 // Use concrete types when possible for improved performance
-
-        private static int ParseInteger32(IntPtr dataPtr)
-        {
-            return Marshal.ReadInt32(dataPtr);
-        }
-
-        private static long ParseInteger64(IntPtr dataPtr)
-        {
-            return Marshal.ReadInt64(dataPtr);
-        }
-
-        private static float ParseFloat32(IntPtr dataPtr)
-        {
-            var bytes = Float32Bytes.Value!;
-            Marshal.Copy(dataPtr, bytes, 0, 4);
-            return BitConverter.ToSingle(bytes, 0);
-        }
-
-#pragma warning disable CA1859 // Use concrete types when possible for improved performance
-        private static object ParseFloat64Value(IntPtr dataPtr, Type expectedType)
-#pragma warning restore CA1859 // Use concrete types when possible for improved performance
-        {
-            var value = ParseFloat64(dataPtr);
-
-            // Handle float conversion
-            if (expectedType == typeof(float))
-            {
-                return (float)value;
-            }
-
-            return value;
-        }
-
-        private static object? ParseType(IntPtr dataPtr, SimConnectDataType simConnectType, Type fieldType)
-        {
-            return fieldType switch
-            {
-            Type t when t == typeof(int) => ParseInteger32(dataPtr),
-            Type t when t == typeof(long) => ParseInteger64(dataPtr),
-            Type t when t == typeof(float) => ParseFloat32(dataPtr),
-            Type t when t == typeof(double) => ParseFloat64(dataPtr),
-            Type t when t == typeof(string) => ParseString(dataPtr, simConnectType),
-            Type t when t == typeof(bool) => ParseInteger32(dataPtr) != 0,
-            _ => Marshal.PtrToStructure(dataPtr, fieldType),
-            };
-        }
-
-        private static double ParseFloat64(IntPtr dataPtr)
-        {
-            var bytes = Float64Bytes.Value!;
-            Marshal.Copy(dataPtr, bytes, 0, 8);
-            return BitConverter.ToDouble(bytes, 0);
-        }
-
         private static string ParseString(IntPtr dataPtr, SimConnectDataType dataType)
         {
             var maxLength = dataType switch
@@ -571,69 +554,76 @@ namespace SimConnect.NET.SimVar
                 SimConnectDataType.String128 => 128,
                 SimConnectDataType.String256 => 256,
                 SimConnectDataType.String260 => 260,
-                SimConnectDataType.StringV => 256, // Default for variable length
-                _ => 256,
+                SimConnectDataType.StringV => -1,
+                _ => -1,
             };
 
-            return Marshal.PtrToStringAnsi(dataPtr, maxLength)?.TrimEnd('\0') ?? string.Empty;
+            if (maxLength == -1)
+            {
+                throw new NotSupportedException("Variable-length SimVar strings (StringV) are not supported. Use a fixed-length string type (e.g., String256).");
+            }
+
+            return SimVarMemoryReader.ReadFixedString(dataPtr, maxLength);
         }
 
-        private static void CancelRequest(object request)
+    /// <summary>
+    /// Wrapper to call SimConnect_RequestDataOnSimObject with consistent error handling.
+    /// A local context string is generated from the parameters for logging and exception messages.
+    /// </summary>
+        /// <param name="requestId">The SimConnect request identifier.</param>
+        /// <param name="definitionId">The data definition identifier.</param>
+        /// <param name="objectId">The target object identifier.</param>
+    /// <param name="period">The request period.</param>
+    /// <remarks>Throws a SimConnectException on error (except when period == Never which is used internally for cancellation).</remarks>
+        private void RequestDataOnSimObject(
+            uint requestId,
+            uint definitionId,
+            uint objectId,
+            SimConnectPeriod period)
         {
-            var requestType = request.GetType();
-            if (requestType.IsGenericType && requestType.GetGenericTypeDefinition() == typeof(SimVarRequest<>))
+            var hr = SimConnectNative.SimConnect_RequestDataOnSimObject(
+                this.simConnectHandle,
+                requestId,
+                definitionId,
+                objectId,
+                (uint)period);
+
+            // Build a local context string from parameters for logging and exceptions
+            var localContext = period != SimConnectPeriod.Once && period != SimConnectPeriod.Never
+                ? $"subscribe (RequestId={requestId}, DefinitionId={definitionId}, ObjectId={objectId})"
+                : $"request (RequestId={requestId}, DefinitionId={definitionId}, ObjectId={objectId})";
+
+            if (hr != (int)SimConnectError.None && period != SimConnectPeriod.Never)
             {
-                var method = requestType.GetMethod("SetCanceled");
-                method?.Invoke(request, null);
+                throw new SimConnectException($"Failed to {localContext}: {(SimConnectError)hr}", (SimConnectError)hr);
             }
         }
 
-        private async Task<T> GetWithDefinitionAsync<T>(SimVarDefinition definition, uint objectId, CancellationToken cancellationToken)
+        /// <summary>
+        /// Creates and registers a SimVar request, then performs the SimConnect request call atomically.
+        /// Ensures the pending request is visible before SimConnect may deliver a response to avoid race conditions.
+        /// Subscription/one-shot path (no descriptor).
+        /// </summary>
+        /// <typeparam name="T">The value or struct type of the request.</typeparam>
+        /// <param name="definitionId">The data definition identifier.</param>
+        /// <param name="objectId">The target object identifier.</param>
+        /// <param name="period">The request period.</param>
+        /// <param name="onValue">Optional callback for recurring subscriptions.</param>
+        /// <returns>The created SimVarRequest instance.</returns>
+        private SimVarRequest<T> StartRequest<T>(
+            uint definitionId,
+            uint objectId,
+            SimConnectPeriod period,
+            Action<T>? onValue)
         {
-            var definitionId = await this.EnsureDataDefinitionAsync(definition, cancellationToken).ConfigureAwait(false);
             var requestId = Interlocked.Increment(ref this.nextRequestId);
-
-            var request = new SimVarRequest<T>(requestId, definition, objectId);
+            var request = new SimVarRequest<T>(requestId, objectId, definitionId, period, onValue);
             this.pendingRequests[requestId] = request;
-
-            SimConnectLogger.Debug($"Making SimVar request: {definition.Name}, RequestId={requestId}, DefinitionId={definitionId}");
 
             try
             {
-                var result = SimConnectNative.SimConnect_RequestDataOnSimObject(
-                    this.simConnectHandle,
-                    requestId,
-                    definitionId,
-                    objectId,
-                    (uint)SimConnectPeriod.Once);
-
-                if (result != (int)SimConnectError.None)
-                {
-                    this.pendingRequests.TryRemove(requestId, out _);
-                    throw new SimConnectException($"Failed to request SimVar {definition.Name}: {(SimConnectError)result}", (SimConnectError)result);
-                }
-
-                SimConnectLogger.Debug($"SimConnect_RequestDataOnSimObject succeeded for RequestId={requestId}");
-
-                // Wait for the response with cancellation support
-                using (cancellationToken.Register(() => request.SetCanceled()))
-                {
-                    Task<T> taskToAwait = request.Task;
-                    if (this.requestTimeout != Timeout.InfiniteTimeSpan)
-                    {
-                        var timeoutTask = Task.Delay(this.requestTimeout, CancellationToken.None);
-                        var completed = await Task.WhenAny(taskToAwait, timeoutTask).ConfigureAwait(false);
-                        if (completed == timeoutTask)
-                        {
-                            this.pendingRequests.TryRemove(requestId, out _);
-                            request.SetException(new TimeoutException($"SimVar request '{definition.Name}' timed out after {this.requestTimeout} (RequestId={requestId})"));
-                        }
-                    }
-
-                    var result_task = await taskToAwait.ConfigureAwait(false);
-                    SimConnectLogger.Info($"SimVar request completed successfully: {definition.Name} = {result_task}");
-                    return result_task;
-                }
+                this.RequestDataOnSimObject(requestId, definitionId, objectId, period);
+                return request;
             }
             catch
             {
@@ -642,81 +632,254 @@ namespace SimConnect.NET.SimVar
             }
         }
 
-        private async Task SetWithDefinitionAsync<T>(SimVarDefinition definition, T value, uint objectId, CancellationToken cancellationToken)
+        /// <summary>
+        /// Core handler for one-shot Get requests (always SimConnectPeriod.Once) that returns the retrieved value.
+        /// </summary>
+        /// <typeparam name="T">The value or struct type.</typeparam>
+        /// <param name="definitionId">The SimConnect data definition id.</param>
+        /// <param name="objectId">The target object id (usually SIMCONNECT_OBJECT_ID_USER).</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <returns>The retrieved value.</returns>
+        private async Task<T> GetAsyncCore<T>(uint definitionId, uint objectId, CancellationToken cancellationToken)
         {
-            var definitionId = await this.EnsureDataDefinitionAsync(definition, cancellationToken).ConfigureAwait(false);
+            var request = this.StartRequest<T>(definitionId, objectId, SimConnectPeriod.Once, onValue: null);
 
-            cancellationToken.ThrowIfCancellationRequested();
-
-            // Allocate memory for the value
-            var dataSize = GetDataSize<T>();
-            var dataPtr = Marshal.AllocHGlobal(dataSize);
-
-            try
+            using (cancellationToken.Register(() => this.CancelRequest(request)))
             {
-                // Marshal the value to unmanaged memory
-                MarshalValue(value, dataPtr);
-
-                var result = SimConnectNative.SimConnect_SetDataOnSimObject(
-                    this.simConnectHandle,
-                    definitionId,
-                    objectId,
-                    0, // flags
-                    1, // arrayCount
-                    (uint)dataSize,
-                    dataPtr);
-
-                if (result != (int)SimConnectError.None)
+                Task<T> awaited = request.Task;
+                if (this.requestTimeout != Timeout.InfiniteTimeSpan)
                 {
-                    throw new SimConnectException($"Failed to set SimVar {definition.Name}: {(SimConnectError)result}", (SimConnectError)result);
+                    var timeoutTask = Task.Delay(this.requestTimeout, CancellationToken.None);
+                    var completed = await Task.WhenAny(awaited, timeoutTask).ConfigureAwait(false);
+                    if (completed == timeoutTask)
+                    {
+                        this.pendingRequests.TryRemove(request.RequestId, out _);
+                        throw new TimeoutException($"Request '{typeof(T).Name}' timed out after {this.requestTimeout} (RequestId={request.RequestId})");
+                    }
                 }
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(dataPtr);
+
+                var value = await awaited.ConfigureAwait(false);
+                return value;
             }
         }
 
-        private Task<uint> EnsureDataDefinitionAsync(SimVarDefinition definition, CancellationToken cancellationToken)
+        private async Task SetWithDefinitionAsync<T>(SimVarDefinition definition, T value, uint objectId, CancellationToken cancellationToken)
         {
-            var key = (definition.Name, definition.Unit);
+            var definitionId = this.EnsureDataDefinition(definition, cancellationToken);
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // Offload blocking marshaling + native call to thread-pool so the async method can await
+            await Task.Run(
+                () =>
+                {
+                    // Allocate memory for the value
+                    var dataSize = GetDataSize<T>();
+                    var dataPtr = Marshal.AllocHGlobal(dataSize);
+
+                    try
+                    {
+                        // Marshal the value to unmanaged memory
+                        MarshalValue(value, dataPtr);
+
+                        var result = SimConnectNative.SimConnect_SetDataOnSimObject(
+                            this.simConnectHandle,
+                            definitionId,
+                            objectId,
+                            0, // flags
+                            1, // arrayCount
+                            (uint)dataSize,
+                            dataPtr);
+
+                        if (result != (int)SimConnectError.None)
+                        {
+                            throw new SimConnectException($"Failed to set SimVar {definition.Name}: {(SimConnectError)result}", (SimConnectError)result);
+                        }
+                    }
+                    finally
+                    {
+                        Marshal.FreeHGlobal(dataPtr);
+                    }
+                },
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        private uint EnsureDataDefinition(SimVarDefinition definition, CancellationToken cancellationToken)
+        {
+            var key = (Name: definition.Name, Unit: definition.Unit, DataType: definition.DataType);
 
             if (this.dataDefinitions.TryGetValue(key, out var existingId))
             {
                 SimConnectLogger.Debug($"Reusing existing definition ID {existingId} for {key.Name}|{key.Unit}");
-                return Task.FromResult(existingId);
+                return existingId;
             }
 
-            return Task.Run(
-                () =>
+            return this.EnsureScalarDefinition(definition.Name, definition.Unit, definition.DataType, cancellationToken);
+        }
+
+        /// <summary>
+        /// Ensures a scalar (name + unit) data definition exists and registers its parser.
+        /// Now encapsulates lookup and creation using primitive inputs.
+        /// </summary>
+        /// <param name="name">SimVar name.</param>
+        /// <param name="unit">Unit string.</param>
+        /// <param name="dataType">SimConnect data type.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <returns>Definition ID.</returns>
+        private uint EnsureScalarDefinition(string name, string? unit = null, SimConnectDataType? dataType = null, CancellationToken cancellationToken = default)
+        {
+            if (unit == null || dataType == null)
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                var definition = SimVarRegistry.Get(name);
 
-                // Re-check in case another thread added it while we were waiting to run
-                if (this.dataDefinitions.TryGetValue(key, out var recheckedId))
+                if (definition != null)
                 {
-                    return recheckedId;
+                    unit ??= definition.Unit;
+                    dataType ??= definition.DataType;
                 }
+            }
 
-                var definitionId = Interlocked.Increment(ref this.nextDefinitionId);
-                SimConnectLogger.Debug($"Creating new definition ID {definitionId} for {key.Name}|{key.Unit}");
+            if (unit == null || dataType is not SimConnectDataType dt)
+            {
+                throw new ArgumentException($"Unit and dataType must not be null for SimVar '{name}'.");
+            }
 
-                var result = SimConnectNative.SimConnect_AddToDataDefinition(
-                    this.simConnectHandle,
-                    definitionId,
-                    definition.Name,
-                    definition.Unit,
-                    (uint)definition.DataType);
+            var key = (Name: name, Unit: unit, DataType: dt);
 
-                if (result != (int)SimConnectError.None)
+            if (this.dataDefinitions.TryGetValue(key, out var existingId))
+            {
+                SimConnectLogger.Debug($"Reusing existing definition ID {existingId} for {key.Name}|{key.Unit}");
+                return existingId;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // Re-check after potential waiting (none here but pattern consistent)
+            if (this.dataDefinitions.TryGetValue(key, out existingId))
+            {
+                return existingId;
+            }
+
+            var definitionId = Interlocked.Increment(ref this.nextDefinitionId);
+            SimConnectLogger.Debug($"Creating new definition ID {definitionId} for {name}|{unit}");
+
+            var result = SimConnectNative.SimConnect_AddToDataDefinition(
+                this.simConnectHandle,
+                definitionId,
+                name,
+                unit,
+                (uint)dataType);
+
+            if (result != (int)SimConnectError.None)
+            {
+                throw new SimConnectException($"Failed to add data definition for {name}: {(SimConnectError)result}", (SimConnectError)result);
+            }
+
+            this.defToParser[definitionId] = (IntPtr ptr, ISimVarRequest req) =>
+            {
+                switch (dt)
                 {
-                    throw new SimConnectException($"Failed to add data definition for {definition.Name}: {(SimConnectError)result}", (SimConnectError)result);
-                }
+                    case SimConnectDataType.Integer32:
+                        {
+                            int v = SimVarMemoryReader.ReadInt32(ptr);
+                            if (req.TrySetResult(v))
+                            {
+                                return;
+                            }
 
-                this.dataDefinitions[key] = definitionId;
-                return definitionId;
-            },
-                cancellationToken);
+                            if (req.TrySetResult(v != 0))
+                            {
+                                return;
+                            }
+
+                            req.SetResultBoxed(v);
+                            return;
+                        }
+
+                    case SimConnectDataType.Integer64:
+                        {
+                            long v = SimVarMemoryReader.ReadInt64(ptr);
+                            if (!req.TrySetResult(v))
+                            {
+                                req.SetResultBoxed(v);
+                            }
+
+                            return;
+                        }
+
+                    case SimConnectDataType.FloatSingle:
+                        {
+                            float v = SimVarMemoryReader.ReadFloat(ptr);
+                            if (!req.TrySetResult(v))
+                            {
+                                req.SetResultBoxed((double)v);
+                            }
+
+                            return;
+                        }
+
+                    case SimConnectDataType.FloatDouble:
+                        {
+                            double v = SimVarMemoryReader.ReadDouble(ptr);
+                            if (req.TrySetResult(v))
+                            {
+                                return;
+                            }
+
+                            if (req.TrySetResult((float)v))
+                            {
+                                return;
+                            }
+
+                            req.SetResultBoxed(v);
+                            return;
+                        }
+
+                    case SimConnectDataType.String8:
+                    case SimConnectDataType.String32:
+                    case SimConnectDataType.String64:
+                    case SimConnectDataType.String128:
+                    case SimConnectDataType.String256:
+                    case SimConnectDataType.String260:
+                        {
+                            string s = ParseString(ptr, dt);
+                            if (!req.TrySetResult(s))
+                            {
+                                req.SetResultBoxed(s);
+                            }
+
+                            return;
+                        }
+
+                    case SimConnectDataType.LatLonAlt:
+                        {
+                            var v = Marshal.PtrToStructure<SimConnectDataLatLonAlt>(ptr);
+                            if (!req.TrySetResult(v))
+                            {
+                                req.SetResultBoxed(v);
+                            }
+
+                            return;
+                        }
+
+                    case SimConnectDataType.Xyz:
+                        {
+                            var v = Marshal.PtrToStructure<SimConnectDataXyz>(ptr);
+                            if (!req.TrySetResult(v))
+                            {
+                                req.SetResultBoxed(v);
+                            }
+
+                            return;
+                        }
+
+                    default:
+                        throw new NotSupportedException($"Data type {dataType} is not supported");
+                }
+            };
+
+            this.dataDefinitions[key] = definitionId;
+            return definitionId;
         }
     }
 }

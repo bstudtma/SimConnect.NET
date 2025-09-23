@@ -53,6 +53,11 @@ namespace SimConnect.NET.Tests.Net8.Tests
                     return false;
                 }
 
+                if (!await TestSubscriptions(client, cts.Token))
+                {
+                    return false;
+                }
+
                 Console.WriteLine("   ✅ All SimVar operations successful");
                 return true;
             }
@@ -177,6 +182,93 @@ namespace SimConnect.NET.Tests.Net8.Tests
 
             return results.All(r => !double.IsNaN(r) && !double.IsInfinity(r));
         }
+
+        private static async Task<bool> TestSubscriptions(SimConnectClient client, CancellationToken cancellationToken)
+        {
+            Console.WriteLine("   🔍 Testing subscriptions...");
+            int updatesReceived = 0;
+
+            var title = await client.SimVars.GetAsync<string>("TITLE", cancellationToken: cancellationToken);
+
+            using var subscription = client.SimVars.Subscribe<Position>(
+                SimConnectPeriod.VisualFrame,
+                (position) =>
+                {
+                    if (position.Altitude <= 0)
+                    {
+                        Console.WriteLine("   ❌ Received invalid position update (non-positive altitude)");
+                    }
+                    else if (position.Title != title)
+                    {
+                        Console.WriteLine($"   ❌ Received invalid position update (unexpected title: {position.Title})");
+                    }
+                    else
+                    {
+                        updatesReceived++;
+                    }
+                },
+                cancellationToken: cancellationToken);
+
+            // Allow 1 second for initial subscription updates before enumerating
+            await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+
+            if (subscription.Completion.IsFaulted)
+            {
+                Console.WriteLine($"   ❌ Subscription faulted: {subscription.Completion.Exception}");
+                return false;
+            }
+            else if (subscription.Completion.IsCompleted)
+            {
+                Console.WriteLine("   ❌ Subscription completed prematurely");
+                return false;
+            }
+            else if (subscription.Completion.IsCanceled)
+            {
+                Console.WriteLine("   ❌ Subscription was canceled prematurely");
+                return false;
+            }
+
+            subscription.Dispose();
+
+            // Non-throwing wait pattern: avoid first-chance TaskCanceledException by inspecting status
+            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
+            var finished = await Task.WhenAny(subscription.Completion, timeoutTask);
+            if (finished != subscription.Completion)
+            {
+                Console.WriteLine("   ❌ Subscription did not complete (cancel/fault) within timeout");
+                return false;
+            }
+
+            if (subscription.Completion.IsFaulted)
+            {
+                Console.WriteLine($"   ❌ Subscription faulted after dispose: {subscription.Completion.Exception}");
+                return false;
+            }
+
+            // Subscriptions are expected to transition to Canceled when disposed
+            if (!subscription.Completion.IsCanceled)
+            {
+                if (subscription.Completion.IsCompleted)
+                {
+                    Console.WriteLine("   ❌ Subscription completed instead of being canceled after dispose");
+                }
+                else
+                {
+                    Console.WriteLine("   ❌ Subscription did not cancel after dispose");
+                }
+
+                return false;
+            }
+
+            if (updatesReceived == 0)
+            {
+                Console.WriteLine("   ❌ No subscription updates received");
+                return false;
+            }
+
+            Console.WriteLine($"      ✅ Received {updatesReceived} updates");
+            return true;
+        }
     }
 }
 
@@ -202,4 +294,10 @@ public struct Position
     /// </summary>
     [SimConnect("PLANE ALTITUDE", "feet")]
     public double Altitude;
+
+    /// <summary>
+    /// Gets or sets the aircraft title as reported by the simulator.
+    /// </summary>
+    [SimConnect("TITLE", SimConnectDataType.String128)]
+    public string Title;
 }
