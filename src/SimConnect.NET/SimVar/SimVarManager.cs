@@ -129,6 +129,33 @@ namespace SimConnect.NET.SimVar
         }
 
         /// <summary>
+        /// Sets multiple SimVars in one call by passing a struct annotated with <see cref="SimConnectAttribute"/> fields.
+        /// This mirrors the struct-based GetAsync and uses the same definition/layout.
+        /// </summary>
+        /// <typeparam name="T">The struct type to write. Must have public fields annotated with <see cref="SimConnectAttribute"/>.</typeparam>
+        /// <param name="value">The struct instance whose fields should be written.</param>
+        /// <param name="objectId">The SimConnect object ID (defaults to user aircraft).</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <returns>A task that represents the asynchronous set operation.</returns>
+        public async Task SetAsync<T>(
+            T value,
+            uint objectId = SimConnectObjectIdUser,
+            CancellationToken cancellationToken = default)
+            where T : struct
+        {
+            ObjectDisposedException.ThrowIf(this.disposed, nameof(SimVarManager));
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (this.simConnectHandle == IntPtr.Zero)
+            {
+                throw new InvalidOperationException("SimConnect handle is not initialized.");
+            }
+
+            var defId = this.EnsureTypeDefinition<T>(cancellationToken);
+            await this.SetStructAsync(defId, value, objectId, cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>
         /// Gets a full struct from SimConnect as a strongly-typed object using a dynamically built data definition.
         /// </summary>
         /// <typeparam name="T">The struct type to request. Must be blittable/marshalable.</typeparam>
@@ -328,7 +355,10 @@ namespace SimConnect.NET.SimVar
                     }
                     catch (Exception ex)
                     {
-                        SimConnectLogger.Debug($"Suppressing error disposing subscription {kvp.Key}: {ex.Message}");
+                        if (SimConnectLogger.IsLevelEnabled(SimConnectLogger.LogLevel.Debug))
+                        {
+                            SimConnectLogger.Debug($"Suppressing error disposing subscription {kvp.Key}: {ex.Message}");
+                        }
                     }
                 }
 
@@ -424,12 +454,19 @@ namespace SimConnect.NET.SimVar
             {
                 try
                 {
-                    SimConnectLogger.Debug($"Canceling recurring request {request.RequestId} (Def={request.DefinitionId}, Obj={request.ObjectId})");
+                    if (SimConnectLogger.IsLevelEnabled(SimConnectLogger.LogLevel.Debug))
+                    {
+                        SimConnectLogger.Debug($"Canceling recurring request {request.RequestId} (Def={request.DefinitionId}, Obj={request.ObjectId})");
+                    }
+
                     this.RequestDataOnSimObject(request.RequestId, request.DefinitionId, request.ObjectId, SimConnectPeriod.Never);
                 }
                 catch (Exception ex)
                 {
-                    SimConnectLogger.Debug($"Suppressing error during CancelRequest for {request.RequestId}: {ex.Message}");
+                    if (SimConnectLogger.IsLevelEnabled(SimConnectLogger.LogLevel.Debug))
+                    {
+                        SimConnectLogger.Debug($"Suppressing error during CancelRequest for {request.RequestId}: {ex.Message}");
+                    }
                 }
             }
 
@@ -566,15 +603,15 @@ namespace SimConnect.NET.SimVar
             return SimVarMemoryReader.ReadFixedString(dataPtr, maxLength);
         }
 
-    /// <summary>
-    /// Wrapper to call SimConnect_RequestDataOnSimObject with consistent error handling.
-    /// A local context string is generated from the parameters for logging and exception messages.
-    /// </summary>
+        /// <summary>
+        /// Wrapper to call SimConnect_RequestDataOnSimObject with consistent error handling.
+        /// A local context string is generated from the parameters for logging and exception messages.
+        /// </summary>
         /// <param name="requestId">The SimConnect request identifier.</param>
         /// <param name="definitionId">The data definition identifier.</param>
         /// <param name="objectId">The target object identifier.</param>
-    /// <param name="period">The request period.</param>
-    /// <remarks>Throws a SimConnectException on error (except when period == Never which is used internally for cancellation).</remarks>
+        /// <param name="period">The request period.</param>
+        /// <remarks>Throws a SimConnectException on error (except when period == Never which is used internally for cancellation).</remarks>
         private void RequestDataOnSimObject(
             uint requestId,
             uint definitionId,
@@ -710,7 +747,11 @@ namespace SimConnect.NET.SimVar
 
             if (this.dataDefinitions.TryGetValue(key, out var existingId))
             {
-                SimConnectLogger.Debug($"Reusing existing definition ID {existingId} for {key.Name}|{key.Unit}");
+                if (SimConnectLogger.IsLevelEnabled(SimConnectLogger.LogLevel.Debug))
+                {
+                    SimConnectLogger.Debug($"Reusing existing definition ID {existingId} for {key.Name}|{key.Unit}");
+                }
+
                 return existingId;
             }
 
@@ -748,7 +789,11 @@ namespace SimConnect.NET.SimVar
 
             if (this.dataDefinitions.TryGetValue(key, out var existingId))
             {
-                SimConnectLogger.Debug($"Reusing existing definition ID {existingId} for {key.Name}|{key.Unit}");
+                if (SimConnectLogger.IsLevelEnabled(SimConnectLogger.LogLevel.Debug))
+                {
+                    SimConnectLogger.Debug($"Reusing existing definition ID {existingId} for {key.Name}|{key.Unit}");
+                }
+
                 return existingId;
             }
 
@@ -761,7 +806,10 @@ namespace SimConnect.NET.SimVar
             }
 
             var definitionId = Interlocked.Increment(ref this.nextDefinitionId);
-            SimConnectLogger.Debug($"Creating new definition ID {definitionId} for {name}|{unit}");
+            if (SimConnectLogger.IsLevelEnabled(SimConnectLogger.LogLevel.Debug))
+            {
+                SimConnectLogger.Debug($"Creating new definition ID {definitionId} for {name}|{unit}");
+            }
 
             var result = SimConnectNative.SimConnect_AddToDataDefinition(
                 this.simConnectHandle,
@@ -880,6 +928,51 @@ namespace SimConnect.NET.SimVar
 
             this.dataDefinitions[key] = definitionId;
             return definitionId;
+        }
+
+        /// <summary>
+        /// Core handler that writes a struct T using the same field layout as EnsureTypeDefinition created.
+        /// </summary>
+        private async Task SetStructAsync<T>(uint definitionId, T value, uint objectId, CancellationToken cancellationToken)
+            where T : struct
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // Build writers without re-adding to definition; EnsureTypeDefinition already registered it.
+            var (writers, totalSize) = SimVarFieldWriterFactory.Build<T>(addToDefinition: null);
+
+            await Task.Run(
+                () =>
+                {
+                    var dataPtr = Marshal.AllocHGlobal(totalSize);
+                    try
+                    {
+                        // Fill the buffer in the same order/sizes as the definition
+                        foreach (var w in writers)
+                        {
+                            w.WriteFrom(in value, dataPtr);
+                        }
+
+                        var hr = SimConnectNative.SimConnect_SetDataOnSimObject(
+                            this.simConnectHandle,
+                            definitionId,
+                            objectId,
+                            0,
+                            1,
+                            (uint)totalSize,
+                            dataPtr);
+
+                        if (hr != (int)SimConnectError.None)
+                        {
+                            throw new SimConnectException($"Failed to set struct '{typeof(T).Name}': {(SimConnectError)hr}", (SimConnectError)hr);
+                        }
+                    }
+                    finally
+                    {
+                        Marshal.FreeHGlobal(dataPtr);
+                    }
+                },
+                cancellationToken).ConfigureAwait(false);
         }
     }
 }
